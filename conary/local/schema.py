@@ -14,7 +14,9 @@
 # limitations under the License.
 #
 
-
+import errno
+import fcntl
+import os
 import sys
 import itertools
 from conary import trove, deps, errors, files, streams
@@ -873,6 +875,16 @@ class MigrateTo_20(SchemaMigration):
         return self.Version
 
 
+def _lockedSql(db, func, *args):
+    """
+    Ensure write lock on database, otherwise concurrent access can result in
+    "schema has changed" errors.
+    """
+    if not db.inTransaction():
+        db.cursor().execute('BEGIN IMMEDIATE')
+    return func(*args)
+
+
 # silent update while we're at schema 20. We only need to create a
 # index, so there is no need to do a full blown migration and stop
 # conary from working until a schema migration is done
@@ -886,16 +898,44 @@ def optSchemaUpdate(db):
         cu.execute('select count(*) from sqlite_stat1')
         count = cu.fetchall()[0][0]
         if count != 0:
-            cu.execute('delete from sqlite_stat1')
+            _lockedSql(db, cu.execute, "DELETE FROM sqlite_stat1")
 
     # Create DatabaseAttributes (if it doesn't exist yet)
-    createDatabaseAttributes(db)
+    if 'DatabaseAttributes' not in db.tables:
+        _lockedSql(db, createDatabaseAttributes, db)
 
     #do we have the index we need?
-    db.createIndex("TroveInfo", "TroveInfoInstTypeIdx", "infoType,instanceId")
-    db.dropIndex('DBTroveFiles', 'DBTroveFilesInstanceIdx')
-    db.createIndex('DBTroveFiles', 'DBTroveFilesInstanceIdx2',
-            'instanceId, pathId')
+    if "TroveInfoInstTypeIdx" not in db.tables["TroveInfo"]:
+        _lockedSql(db, db.createIndex, "TroveInfo", "TroveInfoInstTypeIdx", "infoType,instanceId")
+    if 'DBTroveFilesInstanceIdx' in db.tables['DBTroveFiles']:
+        _lockedSql(db, db.dropIndex, 'DBTroveFiles', 'DBTroveFilesInstanceIdx')
+    if 'DBTroveFilesInstanceIdx2' not in db.tables['DBTroveFiles']:
+        _lockedSql(db, db.createIndex, 'DBTroveFiles',
+                'DBTroveFilesInstanceIdx2', 'instanceId, pathId')
+
+
+def _shareLock(db):
+    """
+    Take a share lock on the database syslock when an optional migration might
+    run. If it conflicts due to an ongoing update then bail out.
+    """
+    if db.database == ':memory:':
+        # Nothing to lock
+        return None, True
+    lockPath = os.path.join(os.path.dirname(db.database), 'syslock')
+    try:
+        lockFile = open(lockPath, 'r+')
+        fcntl.lockf(lockFile.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
+    except IOError as err:
+        if err.args[0] in (errno.EAGAIN, errno.EACCES):
+            # Busy or no write access; skip optional migrations
+            return None, False
+        elif err.args[0] == errno.ENOENT:
+            # Database has never been locked. Probably running in a testsuite,
+            # so proceed anyway.
+            return None, True
+        raise
+    return lockFile, True
 
 
 def checkVersion(db):
@@ -906,10 +946,17 @@ def checkVersion(db):
         # in the next schema update, when we have a reason to block
         # conary functionality...  These schema changes *MUST* not be
         # required for Read Only functionality
+        lockFile = None
         try:
-            optSchemaUpdate(db)
-        except sqlerrors.ReadOnlyDatabase:
-            pass
+            try:
+                lockFile, locked = _shareLock(db)
+                if locked:
+                    optSchemaUpdate(db)
+            except (sqlerrors.ReadOnlyDatabase, sqlerrors.DatabaseLocked):
+                pass
+        finally:
+            if lockFile:
+                lockFile.close()
         return version
     if version > VERSION:
         raise NewDatabaseSchema
